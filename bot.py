@@ -19,10 +19,10 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("astrobot")
 
 # ═══════════════════════ 🔑 BOT TOKEN ═══════════════════════
-# Option 1 (recommended on Render): add an Environment Variable named
-#          TELEGRAM_TOKEN   with the token you got from @BotFather
-# Option 2 (local testing only): paste the token between the quotes below.
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
+# On Render: add an Environment Variable named TELEGRAM_TOKEN
+# with the (new) token you got from @BotFather.
+# For local testing you can run:  export TELEGRAM_TOKEN="your_token_here"
+TOKEN = os.environ.get("8792120272:AAHvhMHbQNqg5lwAnwPXtPuf3R1mTVTHQUc", "")
 # ═════════════════════════════════════════════════════════════
 
 DEFAULT_TZ_MIN = 330  # IST (UTC+5:30). Users can change it with /tz
@@ -1139,9 +1139,9 @@ async def post_init(app: Application):
 
 
 def main():
-    if not TOKEN or TOKEN == "8792120272:AAHvhMHbQNqg5lwAnwPXtPuf3R1mTVTHQUc":
+    if not TOKEN:
         raise SystemExit("❌ Bot token missing! Set the TELEGRAM_TOKEN environment variable "
-                         "(or edit the TOKEN line near the top of this file).")
+                         "(on Render: your service → Environment → add TELEGRAM_TOKEN).")
     keep_alive()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("now", cmd_now), ("date", cmd_date),
