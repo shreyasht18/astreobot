@@ -1,13 +1,12 @@
 import os
 import re
-import html
 import asyncio
 import calendar
 import logging
 from datetime import datetime, timedelta, timezone
 
 import swisseph as swe
-from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -19,7 +18,13 @@ from keep_alive import keep_alive  # Keeps Render awake!
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("astrobot")
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "8792120272:AAHvhMHbQNqg5lwAnwPXtPuf3R1mTVTHQUc")
+# ═══════════════════════ 🔑 BOT TOKEN ═══════════════════════
+# Option 1 (recommended on Render): add an Environment Variable named
+#          TELEGRAM_TOKEN   with the token you got from @BotFather
+# Option 2 (local testing only): paste the token between the quotes below.
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
+# ═════════════════════════════════════════════════════════════
+
 DEFAULT_TZ_MIN = 330  # IST (UTC+5:30). Users can change it with /tz
 
 # ───────────────────────── DATA ─────────────────────────
@@ -34,6 +39,15 @@ NAKSHATRAS = [
 ZODIAC = ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
           "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"]
 SIGN_SYM = ["♈", "♉", "♊", "♋", "♌", "♍", "♎", "♏", "♐", "♑", "♒", "♓"]
+RASHI = ["Mesha", "Vrishabha", "Mithuna", "Karka", "Simha", "Kanya",
+         "Tula", "Vrishchika", "Dhanu", "Makara", "Kumbha", "Meena"]
+# Classical Moon-based Gochar: houses (counted from Janma Rashi) favourable for each planet
+GOOD_HOUSES = {
+    "Sun": [3, 6, 10, 11], "Moon": [1, 3, 6, 7, 10, 11], "Mars": [3, 6, 11],
+    "Mercury": [2, 4, 6, 8, 10, 11], "Jupiter": [2, 5, 7, 9, 11],
+    "Venus": [1, 2, 3, 4, 5, 8, 9, 11, 12], "Saturn": [3, 6, 11],
+    "Rahu": [3, 6, 10, 11], "Ketu": [3, 6, 11],
+}
 SIGN_LORD = ["Mars", "Venus", "Mercury", "Moon", "Sun", "Mercury",
              "Venus", "Mars", "Jupiter", "Saturn", "Saturn", "Jupiter"]
 
@@ -43,6 +57,7 @@ BODIES = {"Sun": swe.SUN, "Moon": swe.MOON, "Mars": swe.MARS, "Mercury": swe.MER
           "Jupiter": swe.JUPITER, "Venus": swe.VENUS, "Saturn": swe.SATURN,
           "Rahu": swe.TRUE_NODE}
 ORDER = ["Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Rahu", "Ketu"]
+NODES = ("Rahu", "Ketu")
 
 EXALT = {"Sun": 0, "Moon": 1, "Mars": 9, "Mercury": 5, "Jupiter": 3,
          "Venus": 11, "Saturn": 6, "Rahu": 1, "Ketu": 7}
@@ -69,6 +84,8 @@ MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
 
 NAK_SPAN = 360 / 27
 FLAGS = swe.FLG_SWIEPH | swe.FLG_SIDEREAL | swe.FLG_SPEED
+
+LEGEND = "<i>R = Retrograde · C = Combust</i>"
 
 
 # ───────────────────────── HELPERS ─────────────────────────
@@ -114,6 +131,10 @@ def fmt_dt(dt):
     return f"{dt.strftime('%a')}, {dt.day:02d} {dt.strftime('%b')} {dt.year} {dt.hour:02d}:{dt.minute:02d}"
 
 
+def fmt_date(dt):
+    return f"{dt.day:02d} {dt.strftime('%b')} {dt.year}"
+
+
 def to_jd(dt_local, tz):
     u = dt_local - timedelta(minutes=tz)
     return swe.julday(u.year, u.month, u.day, u.hour + u.minute / 60.0 + u.second / 3600.0)
@@ -137,6 +158,21 @@ def parse_tz(text):
     if mins > 14 * 60:
         return None
     return -mins if m[1] == "-" else mins
+
+
+def parse_latlon(text):
+    nums = re.findall(r"-?\d+(?:\.\d+)?", text)
+    if len(nums) < 2:
+        return None
+    lat, lon = float(nums[0]), float(nums[1])
+    up = text.upper()
+    if re.search(r"\d\s*°?\s*S\b", up) and lat > 0:
+        lat = -lat
+    if re.search(r"\d\s*°?\s*W\b", up) and lon > 0:
+        lon = -lon
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
 
 
 TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
@@ -192,7 +228,7 @@ def parse_when(text, tz):
         return None
 
 
-# ───────────────────────── ASTRO ENGINE ─────────────────────────
+# ───────────────────────── ASTRO ENGINE (Vedic / Lahiri) ─────────────────────────
 def calc_positions(jd):
     swe.set_sid_mode(swe.SIDM_LAHIRI)
     pos = {}
@@ -209,12 +245,43 @@ def ang_diff(a, b):
     return min(d, 360 - d)
 
 
+def is_retro(name, speed):
+    return speed < 0 or name in NODES
+
+
+def combust_info(name, lon, speed, sun_lon):
+    """Returns None if combustion doesn't apply, else (is_combust, distance_from_sun, limit)."""
+    if name not in COMBUST:
+        return None
+    limit = COMBUST[name]
+    if speed < 0 and name == "Mercury":
+        limit = 12
+    if speed < 0 and name == "Venus":
+        limit = 8
+    dist = ang_diff(lon, sun_lon)
+    return dist <= limit, dist, limit
+
+
+def flags_of(name, lon, speed, sun_lon):
+    out = []
+    if is_retro(name, speed):
+        out.append("R")
+    ci = combust_info(name, lon, speed, sun_lon)
+    if ci and ci[0]:
+        out.append("C")
+    return out
+
+
+def label_of(name, lon, speed, sun_lon):
+    fl = flags_of(name, lon, speed, sun_lon)
+    return name + (f" ({'/'.join(fl)})" if fl else "")
+
+
 def planet_block(name, lon, speed, sun_lon):
     sign = int(lon // 30)
     deg = lon % 30
     nak = int(lon / NAK_SPAN)
     pada = int((lon % NAK_SPAN) / (NAK_SPAN / 4)) + 1
-    retro = speed < 0 or name in ("Rahu", "Ketu")
 
     tags = []
     if EXALT.get(name) == sign:
@@ -223,39 +290,58 @@ def planet_block(name, lon, speed, sun_lon):
         tags.append("⬇️ Debilitated")
     elif sign in OWN.get(name, []):
         tags.append("🏠 Own sign")
-    if name in COMBUST:
-        limit = COMBUST[name]
-        if retro and name == "Mercury":
-            limit = 12
-        if retro and name == "Venus":
-            limit = 8
-        if ang_diff(lon, sun_lon) <= limit:
-            tags.append("🔥 Combust")
 
-    rx = " (Rx)" if retro else ""
+    r = " <b>(R)</b>" if is_retro(name, speed) else ""
     out = (
-        f"<b>{EMOJI[name]} {name}{rx}</b>  {SIGN_SYM[sign]} <b>{ZODIAC[sign]}</b>\n"
-        f"↳ {fmt_deg(deg)}  ·  Lord: {SIGN_LORD[sign]}\n"
+        f"<b>{EMOJI[name]} {name}</b>{r}  {SIGN_SYM[sign]} <b>{ZODIAC[sign]}</b>\n"
+        f"↳ <b>{fmt_deg(deg)}</b>  ·  Lord: {SIGN_LORD[sign]}\n"
         f"↳ {NAKSHATRAS[nak]} Pada {pada}  ·  Nak Lord: {VIM[nak % 9]}\n"
         f"↳ Speed: {speed:+.3f}°/day"
     )
     if tags:
         out += "\n↳ " + "  ".join(tags)
+    ci = combust_info(name, lon, speed, sun_lon)
+    if ci:
+        c, dist, limit = ci
+        if c:
+            out += f"\n↳ 🔥 <b>C – Combust</b> ({fmt_deg(dist)} from Sun, limit {limit}°)"
+        else:
+            out += f"\n↳ ✅ Not combust ({fmt_deg(dist)} from Sun)"
     return out + "\n"
 
 
-def build_positions(dt, tz, planet, live=False):
+def build_positions(dt, tz, planet="All", live=False, view="d"):
     pos = calc_positions(to_jd(dt, tz))
-    names = ORDER if planet == "All" else [planet]
-    blocks = [planet_block(n, pos[n][0], pos[n][1], pos["Sun"][0]) for n in names]
+    sun = pos["Sun"][0]
     badge = "🔴 LIVE" if live else "📅"
     u = dt - timedelta(minutes=tz)
     head = (
-        f"✨ <b>Planetary Positions</b> ✨ <i>(Lahiri)</i>\n"
+        f"✨ <b>Planetary Positions</b> ✨ <i>(Vedic · Lahiri)</i>\n"
         f"{badge} <b>{fmt_dt(dt)}</b> <i>({tz_label(tz)})</i>\n"
-        f"🕒 <i>{u.day:02d} {u.strftime('%b')} {u.year} {u.hour:02d}:{u.minute:02d} UTC</i>\n\n"
+        f"🕒 <i>{fmt_date(u)} {u.hour:02d}:{u.minute:02d} UTC</i>\n\n"
     )
-    return head + "\n".join(blocks)
+
+    if view == "t":
+        rows = [f"{'Planet':<14}{'Sign':<4} {'Deg':<6} Nak"]
+        for n in ORDER:
+            l, sp = pos[n]
+            s, dg = int(l // 30), l % 30
+            dd, mm = int(dg), int((dg - int(dg)) * 60)
+            rows.append(f"{label_of(n, l, sp, sun):<14}{ZODIAC[s][:3]} {dd:02d}°{mm:02d}' "
+                        f"{NAKSHATRAS[int(l / NAK_SPAN)][:4]}")
+        return head + "<pre>" + "\n".join(rows) + "</pre>\n" + LEGEND
+
+    names = ORDER if planet == "All" else [planet]
+    summary = ""
+    if planet == "All":
+        retro = [n for n in ORDER if n not in NODES and pos[n][1] < 0]
+        comb = [n for n in ORDER if (combust_info(n, pos[n][0], pos[n][1], sun) or (False,))[0]]
+        summary = (
+            f"🔁 <b>R</b>: {', '.join(retro) if retro else 'None'} <i>(Rahu/Ketu always R)</i>\n"
+            f"🔥 <b>C</b>: {', '.join(comb) if comb else 'None'}\n\n"
+        )
+    blocks = [planet_block(n, pos[n][0], pos[n][1], sun) for n in names]
+    return head + summary + "\n".join(blocks) + "\n" + LEGEND
 
 
 def build_panchang(dt, tz):
@@ -317,7 +403,7 @@ def lon_of(name, jd):
 def next_ingress(name, jd0):
     swe.set_sid_mode(swe.SIDM_LAHIRI)
     step = 0.1 if name == "Moon" else 0.5
-    limit = 1800
+    limit = 40 if name == "Moon" else 1800
     prev_jd = jd0
     prev_sign = int(lon_of(name, jd0) // 30)
     t = 0.0
@@ -338,7 +424,7 @@ def next_ingress(name, jd0):
     return None
 
 
-def compute_ingresses(dt, tz):
+def build_ingresses(dt, tz):
     jd0 = to_jd(dt, tz)
     rows = []
     for n in ORDER:
@@ -346,387 +432,728 @@ def compute_ingresses(dt, tz):
         if res:
             rows.append((res[0], n, res[1], res[2]))
     rows.sort()
-    head = (f"🔮 <b>Upcoming Sign Changes</b>\n"
+    head = (f"🔮 <b>Rashi Parivartan</b> <i>(Gochar Ingress)</i>\n"
             f"From <b>{fmt_dt(dt)}</b> <i>({tz_label(tz)})</i>\n\n")
     lines = []
     for jd, n, a, b in rows:
         when = jd_to_local(jd, tz)
-        rx = " (Rx)" if b != (a + 1) % 12 else ""
+        rx = " <b>(R)</b>" if b != (a + 1) % 12 else ""
         lines.append(
-            f"{EMOJI[n]} <b>{n}</b> → {SIGN_SYM[b]} <b>{ZODIAC[b]}</b>{rx}\n"
+            f"{EMOJI[n]} <b>{n}</b>: {SIGN_SYM[a]} {RASHI[a]} → {SIGN_SYM[b]} <b>{RASHI[b]}</b>{rx}\n"
             f"   ↳ {fmt_dt(when)}"
         )
-    return head + "\n".join(lines)
+    return head + "\n".join(lines) + "\n\n" + LEGEND
 
 
-def build_chart(birth, tz, lat, lon):
+def ordinal(n):
+    return {1: "1st", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
+
+
+def build_gochar(dt, tz, rashi):
+    pos = calc_positions(to_jd(dt, tz))
+    sun = pos["Sun"][0]
+    lines = [
+        f"🔮 <b>Gochar</b> <i>(Transit from Janma Rashi)</i>\n"
+        f"🌙 Janma Rashi: {SIGN_SYM[rashi]} <b>{RASHI[rashi]}</b> ({ZODIAC[rashi]})\n"
+        f"📅 <b>{fmt_dt(dt)}</b> <i>({tz_label(tz)})</i>\n"
+    ]
+    good_count = 0
+    for n in ORDER:
+        l, sp = pos[n]
+        sgn = int(l // 30)
+        h = (sgn - rashi) % 12 + 1
+        good = h in GOOD_HOUSES[n]
+        good_count += good
+        mark = "✅ Shubh" if good else "⚠️ Ashubh"
+        fl = flags_of(n, l, sp, sun)
+        tag = f" <b>({'/'.join(fl)})</b>" if fl else ""
+        lines.append(
+            f"{EMOJI[n]} <b>{n}</b>{tag} in {SIGN_SYM[sgn]} {RASHI[sgn]} {fmt_deg(l % 30)}\n"
+            f"   ↳ <b>{ordinal(h)}</b> from Moon · {mark}"
+        )
+    d = (int(pos["Saturn"][0] // 30) - rashi) % 12
+    shani = {
+        11: "🪐 <b>Sade Sati – Phase 1</b> (Saturn in 12th, rising)",
+        0: "🪐 <b>Sade Sati – Phase 2</b> (Saturn over Moon, peak)",
+        1: "🪐 <b>Sade Sati – Phase 3</b> (Saturn in 2nd, setting)",
+        7: "🪐 <b>Ashtama Shani</b> (Saturn in 8th from Moon)",
+        3: "🪐 <b>Kantaka Shani</b> (Saturn in 4th from Moon)",
+    }.get(d, "🪐 Sade Sati / Shani Dosha: <b>Not running</b> ✅")
+    lines.append(f"\n{shani}")
+    lines.append(f"📊 Shubh transits: <b>{good_count}/9</b>")
+    lines.append(f"\n{LEGEND}")
+    lines.append("<i>Classical Moon-based Gochar only. A full reading also needs Dasha, Ashtakavarga and Vedha.</i>")
+    return "\n".join(lines)
+
+
+# ───────────── BIRTH CHART DATA ─────────────
+NAK_DEITY = [
+    "Ashwini Kumaras", "Yama", "Agni", "Brahma", "Soma", "Rudra", "Aditi", "Brihaspati",
+    "Nagas", "Pitris", "Bhaga", "Aryaman", "Savitar", "Tvashtar", "Vayu", "Indra-Agni",
+    "Mitra", "Indra", "Nirriti", "Apas", "Vishvadevas", "Vishnu", "Vasus", "Varuna",
+    "Aja Ekapada", "Ahir Budhnya", "Pushan",
+]
+NAK_GANA = "DMRMDMDDRRMMDRDRDRRMMDRRMMD"
+GANA_NAME = {"D": "Deva (divine)", "M": "Manushya (human)", "R": "Rakshasa (fierce)"}
+NAK_SYLL = [
+    "Chu Che Cho La", "Li Lu Le Lo", "A I U E", "O Va Vi Vu", "Ve Vo Ka Ki", "Ku Gha Ng Chha",
+    "Ke Ko Ha Hi", "Hu He Ho Da", "Di Du De Do", "Ma Mi Mu Me", "Mo Ta Ti Tu", "Te To Pa Pi",
+    "Pu Sha Na Tha", "Pe Po Ra Ri", "Ru Re Ro Ta", "Ti Tu Te To", "Na Ni Nu Ne", "No Ya Yi Yu",
+    "Ye Yo Bha Bhi", "Bhu Dha Pha Dha", "Bhe Bho Ja Ji", "Khi Khu Khe Kho", "Ga Gi Gu Ge",
+    "Go Sa Si Su", "Se So Da Di", "Du Tha Jha Na", "De Do Cha Chi",
+]
+ABBR = {"Sun": "Su", "Moon": "Mo", "Mars": "Ma", "Mercury": "Me", "Jupiter": "Ju",
+        "Venus": "Ve", "Saturn": "Sa", "Rahu": "Ra", "Ketu": "Ke"}
+SI_LAYOUT = [[11, 0, 1, 2], [10, None, None, 3], [9, None, None, 4], [8, 7, 6, 5]]
+
+
+def nav_sign(lon):
+    return int(lon * 9 / 30) % 12
+
+
+def sign_map(pos, fn):
+    m = {}
+    for n in ORDER:
+        m.setdefault(fn(pos[n][0]), []).append(ABBR[n])
+    return m
+
+
+def south_chart(smap, asc_sign, title, subtitle=""):
+    """South-Indian style chart (signs fixed in place) as monospace text."""
+    W = 8
+
+    def cell(sg, line):
+        if line == 0:
+            return ZODIAC[sg][:3].center(W)
+        items = list(smap.get(sg, []))
+        if sg == asc_sign:
+            items.insert(0, "As")
+        if line == 1:
+            txt = " ".join(items[:3])
+        elif len(items) <= 6:
+            txt = " ".join(items[3:6])
+        else:
+            txt = " ".join(items[3:5]) + f" +{len(items) - 5}"
+        return txt.center(W)
+
+    full = "+" + "+".join(["-" * W] * 4) + "+"
+    gap = "+" + "-" * W + "+" + " " * (2 * W + 1) + "+" + "-" * W + "+"
+    out = [full]
+    for r, row in enumerate(SI_LAYOUT):
+        for line in range(3):
+            if r in (1, 2):
+                centre = ""
+                if line == 1:
+                    centre = title if r == 1 else subtitle
+                out.append("|" + cell(row[0], line) + "|" + centre.center(2 * W + 1) + "|"
+                           + cell(row[3], line) + "|")
+            else:
+                out.append("|" + "|".join(cell(sg, line) for sg in row) + "|")
+        out.append(gap if r == 1 else full)
+    return "<pre>" + "\n".join(out) + "</pre>"
+
+
+def chart_data(birth, tz, lat, lon):
     jd = to_jd(birth, tz)
     swe.set_sid_mode(swe.SIDM_LAHIRI)
     pos = calc_positions(jd)
     _, ascmc = swe.houses_ex(jd, lat, lon, b"W", swe.FLG_SIDEREAL)
-    asc = ascmc[0] % 360
-    asign = int(asc // 30)
-    anak = int(asc / NAK_SPAN)
+    return pos, ascmc[0] % 360
 
-    lines = [
-        f"🔮 <b>Birth Chart</b> <i>(Lahiri · Whole-sign houses)</i>\n"
-        f"📅 {fmt_dt(birth)} <i>({tz_label(tz)})</i>\n"
-        f"📍 {lat:.2f}, {lon:.2f}\n",
-        f"⬆️ <b>Lagna:</b> {SIGN_SYM[asign]} {ZODIAC[asign]} {fmt_deg(asc % 30)}\n"
-        f"   ↳ {NAKSHATRAS[anak]} · Lord: {SIGN_LORD[asign]}\n",
-    ]
-    for n in ORDER:
-        l, sp = pos[n]
-        s = int(l // 30)
-        house = (s - asign) % 12 + 1
-        rx = " Rx" if (sp < 0 or n in ("Rahu", "Ketu")) else ""
-        lines.append(
-            f"{EMOJI[n]} <b>{n}</b>{rx}: {SIGN_SYM[s]} {ZODIAC[s]} {fmt_deg(l % 30)} · "
-            f"House <b>{house}</b> · {NAKSHATRAS[int(l / NAK_SPAN)]}"
-        )
+
+def detect_yogas(pos, asc_sign):
+    sg = {n: int(pos[n][0] // 30) for n in ORDER}
+    house = {n: (sg[n] - asc_sign) % 12 + 1 for n in ORDER}
+    yogas, doshas = [], []
+
+    if (sg["Jupiter"] - sg["Moon"]) % 12 in (0, 3, 6, 9):
+        yogas.append("🐘 <b>Gaja Kesari Yoga</b>\n   ↳ Jupiter in a Kendra from Moon – wisdom, fame, resilience")
+    if sg["Sun"] == sg["Mercury"]:
+        yogas.append("📚 <b>Budhaditya Yoga</b>\n   ↳ Sun + Mercury together – sharp intellect")
+    if sg["Moon"] == sg["Mars"]:
+        yogas.append("💰 <b>Chandra-Mangal Yoga</b>\n   ↳ Moon + Mars together – drive to earn")
+    mp = {"Mars": "Ruchaka", "Mercury": "Bhadra", "Jupiter": "Hamsa", "Venus": "Malavya", "Saturn": "Shasha"}
+    for n, nm in mp.items():
+        if house[n] in (1, 4, 7, 10) and (sg[n] in OWN[n] or sg[n] == EXALT[n]):
+            yogas.append(f"👑 <b>{nm} Yoga</b> <i>(Pancha Mahapurusha)</i>\n   ↳ {n} strong in a Kendra")
+    if all((sg[n] - sg["Moon"]) % 12 not in (0, 1, 11) for n in ("Mars", "Mercury", "Jupiter", "Venus", "Saturn")):
+        doshas.append("🌑 <b>Kemadruma Yoga</b>\n   ↳ No planets near Moon – inner loneliness; often cancelled by other factors")
+
+    mh, mm = house["Mars"], (sg["Mars"] - sg["Moon"]) % 12 + 1
+    if mh in (1, 2, 4, 7, 8, 12) or mm in (1, 2, 4, 7, 8, 12):
+        src = []
+        if mh in (1, 2, 4, 7, 8, 12):
+            src.append(f"{ordinal(mh)} from Lagna")
+        if mm in (1, 2, 4, 7, 8, 12):
+            src.append(f"{ordinal(mm)} from Moon")
+        doshas.append(f"🔴 <b>Manglik Dosha</b>\n   ↳ Mars in {' &amp; '.join(src)}")
+    else:
+        yogas.append("✅ <b>No Manglik Dosha</b>\n   ↳ Mars is clear of the sensitive houses")
+
+    sides = {((pos[n][0] - pos["Rahu"][0]) % 360) < 180
+             for n in ("Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn")}
+    if len(sides) == 1:
+        doshas.append("🐍 <b>Kaal Sarp Dosha</b>\n   ↳ All planets hemmed between Rahu and Ketu")
+    return yogas, doshas
+
+
+def dasha_page(head, pos, birth, tz):
     moon = pos["Moon"][0]
     idx = int(moon / NAK_SPAN)
     lord = idx % 9
     frac = (moon % NAK_SPAN) / NAK_SPAN
     start = birth - timedelta(days=VIM_YEARS[VIM[lord]] * frac * 365.25)
     now = local_now(tz)
-    lines.append(f"\n🌀 <b>Vimshottari Mahadasha</b> <i>(Moon: {NAKSHATRAS[idx]})</i>")
+    lines = [head, f"🌀 <b>Vimshottari Dasha</b> <i>(Moon in {NAKSHATRAS[idx]})</i>\n"]
+    running = None
     for i in range(9):
         L = VIM[(lord + i) % 9]
         try:
             end = start + timedelta(days=VIM_YEARS[L] * 365.25)
         except OverflowError:
             break
-        shown = max(start, birth)
-        mark = "  👈 <b>running</b>" if start <= now < end else ""
-        lines.append(f"{EMOJI[L]} {L}: {shown.strftime('%b %Y')} → {end.strftime('%b %Y')}{mark}")
+        mark = ""
+        if start <= now < end:
+            mark = "  👈 <b>running</b>"
+            running = (L, start)
+        lines.append(f"{EMOJI[L]} <b>{L}</b>: {fmt_date(start)} → {fmt_date(end)}{mark}")
         start = end
+    if running:
+        L, s = running
+        li = VIM.index(L)
+        lines.append(f"\n🔹 <b>{L} Mahadasha – Antardasha</b>")
+        for j in range(9):
+            S = VIM[(li + j) % 9]
+            try:
+                e = s + timedelta(days=VIM_YEARS[L] * VIM_YEARS[S] / 120 * 365.25)
+            except OverflowError:
+                break
+            mk = "  👈 <b>running</b>" if s <= now < e else ""
+            lines.append(f"{EMOJI[S]} {S}: {fmt_date(s)} → {fmt_date(e)}{mk}")
+            s = e
+    lines.append("\n<i>Dasha years use 365.25-day years.</i>")
     return "\n".join(lines)
 
 
-# ───────────────────────── KEYBOARDS ─────────────────────────
-def nav_rows(mode, dt, planet):
-    def b(label, new_dt):
-        return Btn(label, callback_data=f"{mode}:{stamp(new_dt)}:{planet}")
-    try:
-        return [
-            [b("⏪ -1Y", add_months(dt, -12)), b("◀ -1M", add_months(dt, -1)),
-             b("+1M ▶", add_months(dt, 1)), b("+1Y ⏩", add_months(dt, 12))],
-            [b("-1H", dt - timedelta(hours=1)), b("◀ -1 Day", dt - timedelta(days=1)),
-             b("+1 Day ▶", dt + timedelta(days=1)), b("+1H", dt + timedelta(hours=1))],
-        ]
-    except (OverflowError, ValueError):
-        return []
+def build_chart(ud, tz, page):
+    birth, lat, lon = ud["birth"], ud["lat"], ud["lon"]
+    pos, asc = chart_data(birth, tz, lat, lon)
+    sun = pos["Sun"][0]
+    asc_sign = int(asc // 30)
+    ud["rashi"] = int(pos["Moon"][0] // 30)  # Janma Rashi used by Gochar
+    head = (f"🎂 <b>Birth Chart</b> <i>(Vedic · Lahiri)</i>\n"
+            f"📅 <b>{fmt_dt(birth)}</b> <i>({tz_label(tz)})</i>\n"
+            f"📍 {lat:.3f}, {lon:.3f}\n")
+
+    if page == "asc":
+        mi = int(pos["Moon"][0] / NAK_SPAN)
+        mpada = int((pos["Moon"][0] % NAK_SPAN) / (NAK_SPAN / 4)) + 1
+        msign = int(pos["Moon"][0] // 30)
+        ai = int(asc / NAK_SPAN)
+        rows = []
+        for n in ORDER:
+            l, sp = pos[n]
+            s, dg = int(l // 30), l % 30
+            h = (s - asc_sign) % 12 + 1
+            rows.append(f"{label_of(n, l, sp, sun):<14}{ZODIAC[s][:3]} {int(dg):02d}°{int((dg % 1) * 60):02d}' H{h}")
+        return (
+            head + "\n"
+            f"⬆️ <b>Lagna:</b> {SIGN_SYM[asc_sign]} {ZODIAC[asc_sign]} ({RASHI[asc_sign]}) {fmt_deg(asc % 30)}\n"
+            f"   ↳ {NAKSHATRAS[ai]}\n"
+            f"🌙 <b>Rashi:</b> {SIGN_SYM[msign]} {ZODIAC[msign]} ({RASHI[msign]})\n"
+            f"⭐ <b>Nakshatra:</b> {NAKSHATRAS[mi]} Pada {mpada}\n"
+            f"   ↳ Lord: {VIM[mi % 9]} · Deity: {NAK_DEITY[mi]}\n"
+            f"   ↳ Gana: {GANA_NAME[NAK_GANA[mi]]}\n"
+            f"   ↳ Name syllables: {NAK_SYLL[mi]}\n\n"
+            + south_chart(sign_map(pos, lambda l: int(l // 30)), asc_sign, "RASHI", "D-1")
+            + "\n<pre>" + "\n".join(rows) + "</pre>\n" + LEGEND
+            + "\n<i>Whole-sign houses (H1 = Lagna).</i>"
+        )
+    if page == "nav":
+        nav_asc = nav_sign(asc)
+        return (head + "\n💠 <b>Navamsa (D-9)</b>\n"
+                + south_chart(sign_map(pos, nav_sign), nav_asc, "NAVAMSA", "D-9")
+                + f"\nNavamsa Lagna: {SIGN_SYM[nav_asc]} {ZODIAC[nav_asc]}")
+    if page == "yog":
+        yogas, doshas = detect_yogas(pos, asc_sign)
+        txt = head + "\n🌟 <b>Yogas</b>\n" + ("\n".join(yogas) if yogas else "None detected")
+        txt += "\n\n⚠️ <b>Doshas</b>\n" + ("\n".join(doshas) if doshas else "None detected ✅")
+        return txt
+    return dasha_page(head, pos, birth, tz)
 
 
-def view_keyboard(mode, dt, planet):
-    rows = nav_rows(mode, dt, planet)
-    other = "p" if mode == "v" else "v"
-    other_label = "🕉 Panchang" if mode == "v" else "🪐 Planets"
-    rows.append([
-        Btn("📍 Now", callback_data=f"{mode}:now:{planet}"),
-        Btn("📅 Calendar", callback_data=f"c:{stamp(dt)}:{planet}"),
-        Btn(other_label, callback_data=f"{other}:{stamp(dt)}:{planet if mode == 'v' else 'All'}"),
+# ───────────────────────── UI: KEYBOARDS ─────────────────────────
+MODE_OF = {"pos": "p", "pan": "n", "ing": "i", "goc": "g"}
+MODE_TITLE = {"p": "🪐 Planetary Positions", "n": "🕉 Panchang", "i": "🔮 Rashi Parivartan",
+              "g": "🌙 Gochar", "b": "🎂 Birth Chart"}
+COMMON_TZ = [("🇮🇳 IST +5:30", 330), ("UTC", 0), ("🇬🇧 BST +1", 60), ("🇦🇪 UAE +4", 240),
+             ("🇺🇸 EST −5", -300), ("🇺🇸 PST −8", -480), ("🇸🇬 SGT +8", 480), ("🇦🇺 AEST +10", 600)]
+
+
+def menu_kb(tz):
+    n = local_now(tz)
+    return InlineKeyboardMarkup([
+        [Btn("🪐 Live Positions", callback_data="pos:now:All:d"),
+         Btn("📅 Positions on a date", callback_data=f"cal:p:{n.year}:{n.month}")],
+        [Btn("🕉 Panchang", callback_data="pan:now"), Btn("🔮 Rashi Parivartan", callback_data="ing:now")],
+        [Btn("🌙 Gochar", callback_data="goc:now"), Btn("🎂 Birth Chart", callback_data="ch:asc")],
+        [Btn("🕰 Timezone", callback_data="tz:menu"), Btn("ℹ️ Help", callback_data="help")],
     ])
-    if mode == "v":
-        s = stamp(dt)
-        names = ORDER
-        for i in range(0, 9, 3):
-            rows.append([Btn(f"{EMOJI[n]} {n}", callback_data=f"v:{s}:{n}") for n in names[i:i + 3]])
-        rows.append([Btn("🌌 All Planets", callback_data=f"v:{s}:All"),
-                     Btn("🏠 Menu", callback_data="menu")])
-    else:
-        rows.append([Btn("🏠 Menu", callback_data="menu")])
-    return InlineKeyboardMarkup(rows)
 
 
-def calendar_keyboard(dt, planet):
-    y, m = dt.year, dt.month
-
-    def nav(label, d):
-        return Btn(label, callback_data=f"c:{stamp(d)}:{planet}")
-
-    rows = []
-    try:
-        rows.append([nav("«", add_months(dt, -12)), nav("‹", add_months(dt, -1)),
-                     Btn(f"{calendar.month_abbr[m]} {y}", callback_data="noop"),
-                     nav("›", add_months(dt, 1)), nav("»", add_months(dt, 12))])
-    except (OverflowError, ValueError):
-        pass
-    rows.append([Btn(d, callback_data="noop") for d in "MTWTFSS"])
+def calendar_kb(mode, y, m, tz):
+    y = max(1800, min(2400, y))
+    today = local_now(tz)
+    py, pm = (y, m - 1) if m > 1 else (y - 1, 12)
+    ny, nm = (y, m + 1) if m < 12 else (y + 1, 1)
+    rows = [[
+        Btn("«", callback_data=f"cal:{mode}:{y - 1}:{m}"),
+        Btn("‹", callback_data=f"cal:{mode}:{py}:{pm}"),
+        Btn(f"{calendar.month_abbr[m]} {y} ▾", callback_data=f"yrs:{mode}:{y - 5}"),
+        Btn("›", callback_data=f"cal:{mode}:{ny}:{nm}"),
+        Btn("»", callback_data=f"cal:{mode}:{y + 1}:{m}"),
+    ], [Btn(x, callback_data="noop") for x in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")]]
     for week in calendar.monthcalendar(y, m):
         row = []
         for d in week:
             if d == 0:
                 row.append(Btn(" ", callback_data="noop"))
             else:
-                label = f"·{d}·" if d == dt.day else str(d)
-                row.append(Btn(label, callback_data=f"v:{stamp(dt.replace(day=d))}:{planet}"))
+                lab = f"·{d}·" if (y, m, d) == (today.year, today.month, today.day) else str(d)
+                row.append(Btn(lab, callback_data=f"day:{mode}:{y:04d}{m:02d}{d:02d}"))
         rows.append(row)
-    rows.append([Btn("🔙 Back", callback_data=f"v:{stamp(dt)}:{planet}"),
-                 Btn("🕉 Panchang", callback_data=f"p:{stamp(dt)}:All"),
-                 Btn("🏠 Menu", callback_data="menu")])
+    last = [Btn("📍 Today", callback_data=f"day:{mode}:{today.year:04d}{today.month:02d}{today.day:02d}")]
+    if mode != "b":
+        last.append(Btn("🔴 Now", callback_data=f"tm:{mode}:now"))
+    last.append(Btn("✖ Close", callback_data="close"))
+    rows.append(last)
     return InlineKeyboardMarkup(rows)
 
 
-def menu_keyboard():
+def year_kb(mode, start, tz):
+    start = max(1800, min(2389, start))
+    rows = []
+    for r in range(4):
+        rows.append([Btn(str(start + r * 3 + c), callback_data=f"ys:{mode}:{start + r * 3 + c}")
+                     for c in range(3)])
+    n = local_now(tz)
+    rows.append([Btn("◀ earlier", callback_data=f"yrs:{mode}:{start - 12}"),
+                 Btn("This month", callback_data=f"cal:{mode}:{n.year}:{n.month}"),
+                 Btn("later ▶", callback_data=f"yrs:{mode}:{start + 12}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def month_kb(mode, y):
+    rows = []
+    for r in range(4):
+        rows.append([Btn(calendar.month_abbr[r * 3 + c + 1], callback_data=f"cal:{mode}:{y}:{r * 3 + c + 1}")
+                     for c in range(3)])
+    rows.append([Btn("◀ Years", callback_data=f"yrs:{mode}:{y - 5}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def hour_kb(mode, ds):
+    rows = []
+    for r in range(4):
+        rows.append([Btn(f"{h:02d}", callback_data=f"hr:{mode}:{ds}:{h:02d}") for h in range(r * 6, r * 6 + 6)])
+    rows.append([Btn("⏩ Skip (12:00)", callback_data=f"tm:{mode}:{ds}1200"),
+                 Btn("◀ Calendar", callback_data=f"cal:{mode}:{int(ds[:4])}:{int(ds[4:6])}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def minute_kb(mode, ds, hh):
+    rows = []
+    for r in range(2):
+        rows.append([Btn(f"{hh}:{mi:02d}", callback_data=f"tm:{mode}:{ds}{hh}{mi:02d}")
+                     for mi in range(r * 30, r * 30 + 30, 5)])
+    rows.append([Btn("◀ Hours", callback_data=f"day:{mode}:{ds}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def nav_kb(kind, dt, extra="", top=None, bottom=None):
+    def cb(d):
+        return f"{kind}:{stamp(d)}{extra}"
+    rows = list(top or [])
+    rows.append([Btn("⏮ 1m", callback_data=cb(add_months(dt, -1))),
+                 Btn("◀ 1d", callback_data=cb(dt - timedelta(days=1))),
+                 Btn("1d ▶", callback_data=cb(dt + timedelta(days=1))),
+                 Btn("1m ⏭", callback_data=cb(add_months(dt, 1)))])
+    rows.append([Btn("📅 Pick date", callback_data=f"cal:{MODE_OF[kind]}:{dt.year}:{dt.month}"),
+                 Btn("🔴 Now", callback_data=f"{kind}:now{extra}")])
+    rows.extend(bottom or [])
+    rows.append([Btn("🏠 Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def chart_kb():
+    n = datetime.now()
     return InlineKeyboardMarkup([
-        [Btn("🪐 Live Planets", callback_data="v:now:All"), Btn("🕉 Panchang", callback_data="p:now:All")],
-        [Btn("📅 Pick a Date", callback_data="c:now:All"), Btn("🔮 Next Sign Changes", callback_data="t:now")],
-        [Btn("🌍 Timezone", callback_data="tzmenu"), Btn("❓ Help", callback_data="help")],
+        [Btn("🔮 Rashi", callback_data="ch:asc"), Btn("💠 Navamsa", callback_data="ch:nav"),
+         Btn("🌟 Yogas", callback_data="ch:yog"), Btn("🌀 Dasha", callback_data="ch:das")],
+        [Btn("🔄 New birth data", callback_data=f"cal:b:{n.year - 30}:{n.month}")],
+        [Btn("🏠 Menu", callback_data="menu")],
     ])
 
 
-def back_keyboard(extra=None):
-    rows = [extra] if extra else []
+# ───────────────────────── UI: VIEW BUILDERS ─────────────────────────
+def build_view(kind, ud, tz, st, args):
+    dt = parse_stamp(st, tz)
+    if kind == "pos":
+        planet = args[0] if args else "All"
+        view = args[1] if len(args) > 1 else "d"
+        if planet != "All" and planet not in ORDER:
+            planet = "All"
+        text = build_positions(dt, tz, planet, live=(st == "now"), view=view)
+        row1 = [Btn("All", callback_data=f"pos:{st}:All:{view}")]
+        row1 += [Btn(EMOJI[n], callback_data=f"pos:{st}:{n}:{view}") for n in ORDER[:4]]
+        row2 = [Btn(EMOJI[n], callback_data=f"pos:{st}:{n}:{view}") for n in ORDER[4:]]
+        toggle = (Btn("📋 Degree table", callback_data=f"pos:{st}:All:t") if view == "d"
+                  else Btn("📖 Detailed", callback_data=f"pos:{st}:All:d"))
+        kb = nav_kb("pos", dt, f":{planet}:{view}", top=[row1, row2], bottom=[[toggle]])
+        return text, kb
+    if kind == "pan":
+        return build_panchang(dt, tz), nav_kb("pan", dt)
+    if kind == "ing":
+        return build_ingresses(dt, tz), nav_kb("ing", dt)
+    # Gochar
+    rashi = ud.get("rashi")
+    if rashi is None:
+        return rashi_picker(ud, st)
+    kb = nav_kb("goc", dt, bottom=[[Btn("🌙 Change Rashi", callback_data=f"rs:menu:{st}")]])
+    return build_gochar(dt, tz, rashi), kb
+
+
+def rashi_picker(ud, st):
+    rows = []
+    for r in range(4):
+        rows.append([Btn(f"{SIGN_SYM[i]} {RASHI[i]}", callback_data=f"rs:{i}:{st}")
+                     for i in range(r * 3, r * 3 + 3)])
+    if "birth" in ud:
+        rows.append([Btn("🎂 Use my birth chart Moon", callback_data=f"rs:b:{st}")])
     rows.append([Btn("🏠 Menu", callback_data="menu")])
-    return InlineKeyboardMarkup(rows)
+    return ("🌙 <b>Select your Janma Rashi</b> (Moon sign)\nNeeded for Gochar. "
+            "Tip: create a birth chart and it's picked automatically."), InlineKeyboardMarkup(rows)
 
 
-# ───────────────────────── TEXTS ─────────────────────────
 HELP = (
-    "❓ <b>How to use AstroBot</b>\n\n"
-    "<b>Commands</b>\n"
-    "/start – main menu\n"
-    "/planets – live planetary positions\n"
-    "/panchang – tithi, nakshatra, yoga, karana\n"
-    "/date – any date, past or future\n"
-    "/transits – upcoming sign changes\n"
-    "/chart – birth chart + dasha\n"
-    "/tz – set your timezone\n\n"
-    "<b>View any date</b>\n"
-    "<code>/date 2031-08-15</code>\n"
-    "<code>/date 15/08/2031 18:30</code>\n"
-    "<code>/date 15 aug 2031</code>\n"
-    "<code>/date +90</code> (90 days ahead) · <code>/date -2y</code> · <code>+3m</code> · <code>+1w</code>\n"
-    "👉 Or just <b>send a date as a message</b> and I'll show it!\n\n"
-    "<b>Birth chart</b>\n"
-    "<code>/chart 15-01-2000 14:30 28.61 77.20</code>\n"
-    "(date, time, latitude, longitude – East/North positive; optional timezone at the end, e.g. <code>+5:30</code>)\n\n"
-    "<b>Timezone</b>\n"
-    "<code>/tz +5:30</code> · <code>/tz -8</code>\n\n"
-    "<i>Dates without a time use 12:00 noon. Moon moves ~13°/day, so use the ±1H buttons for precise Moon positions.</i>"
+    "🕉 <b>Vedic Astro Bot</b> <i>(Sidereal · Lahiri)</i>\n\n"
+    "🪐 /now – live planetary degrees\n"
+    "📅 /date – pick any date from a calendar\n"
+    "🕉 /panchang – tithi, nakshatra, yoga, karana\n"
+    "🔮 /ingress – upcoming sign changes\n"
+    "🌙 /gochar – transits from your Moon sign\n"
+    "🎂 /birth – birth chart, Navamsa, yogas, dasha\n"
+    "🕰 /tz – set timezone (default IST)\n\n"
+    "💡 You can also just <b>type a date</b>: <code>14 may 2030</code>, "
+    "<code>2030-05-14 18:30</code>, <code>+10</code>, <code>-3m</code>, <code>tomorrow</code>\n\n"
+    "<b>R</b> = Retrograde · <b>C</b> = Combust"
 )
 
 
-def start_text(name, tz):
-    return (
-        f"✨ <b>Namaste, {html.escape(name)}!</b> ✨\n"
-        f"Welcome to <b>AstroBot</b> 🔭 – Vedic (sidereal · Lahiri) astrology in your pocket.\n\n"
-        f"• Live planet positions with dignity, combustion &amp; retrograde\n"
-        f"• Panchang for any date\n"
-        f"• Browse any day, month or year – past or future\n"
-        f"• Sign-change (ingress) finder\n"
-        f"• Birth chart with Lagna &amp; Vimshottari Dasha\n\n"
-        f"🌍 Timezone: <b>{tz_label(tz)}</b> (change with /tz)"
-    )
+# ───────────────────────── TELEGRAM HELPERS ─────────────────────────
+CALC_LOCK = asyncio.Lock()  # swisseph keeps global state, so run calculations one at a time
 
 
-# ───────────────────────── SENDING ─────────────────────────
-async def send(update, text, kb=None):
-    if update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(
-                text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except BadRequest as e:
-            if "not modified" not in str(e).lower():
-                raise
-    else:
-        await update.effective_message.reply_text(
-            text, reply_markup=kb, parse_mode=ParseMode.HTML)
+async def run_calc(fn, *a):
+    async with CALC_LOCK:
+        return await asyncio.to_thread(fn, *a)
+
+
+async def deliver(update, text, kb=None):
+    q = update.callback_query
+    try:
+        if q:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                      disable_web_page_preview=True)
+        else:
+            await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML,
+                                                      reply_markup=kb, disable_web_page_preview=True)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.exception("deliver failed")
+            raise
+
+
+async def show_view(update, ctx, kind, st="now", args=()):
+    tz = get_tz(ctx)
+    try:
+        text, kb = await run_calc(build_view, kind, ctx.user_data, tz, st, list(args))
+    except Exception:
+        log.exception("view failed")
+        await deliver(update, "⚠️ Couldn't calculate that date. Try another one.", None)
+        return
+    await deliver(update, text, kb)
+
+
+async def show_chart(update, ctx, page="asc"):
+    ud = ctx.user_data
+    if "birth" not in ud or "lat" not in ud:
+        await start_birth(update, ctx)
+        return
+    try:
+        text = await run_calc(build_chart, ud, get_tz(ctx), page)
+    except Exception:
+        log.exception("chart failed")
+        await deliver(update, "⚠️ Couldn't build the chart. Check your birth data with /birth.", None)
+        return
+    await deliver(update, text, chart_kb())
+
+
+async def start_birth(update, ctx):
+    tz = get_tz(ctx)
+    n = local_now(tz)
+    ctx.user_data.pop("await", None)
+    await deliver(update, "🎂 <b>Birth Chart</b>\nPick your <b>birth date</b> "
+                          "(tap the month ▾ to jump to a year):",
+                  calendar_kb("b", n.year - 30, n.month, tz))
 
 
 # ───────────────────────── COMMANDS ─────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.effective_user.first_name if update.effective_user else "friend"
-    await send(update, start_text(name, get_tz(context)), menu_keyboard())
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("await", None)
+    await update.message.reply_text(HELP, parse_mode=ParseMode.HTML, reply_markup=menu_kb(get_tz(ctx)))
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send(update, HELP, back_keyboard())
+async def cmd_now(update, ctx):
+    await show_view(update, ctx, "pos", "now", ("All", "d"))
 
 
-async def planets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tz = get_tz(context)
-    dt = local_now(tz)
-    await send(update, build_positions(dt, tz, "All", live=True), view_keyboard("v", dt, "All"))
+async def cmd_date(update, ctx):
+    tz = get_tz(ctx)
+    n = local_now(tz)
+    await update.message.reply_text(
+        f"{MODE_TITLE['p']}\n📅 Pick a date (tap the month ▾ to jump to another year):",
+        parse_mode=ParseMode.HTML, reply_markup=calendar_kb("p", n.year, n.month, tz))
 
 
-async def panchang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tz = get_tz(context)
-    dt = parse_when(" ".join(context.args), tz) if context.args else local_now(tz)
-    if dt is None:
-        await send(update, "⚠️ Couldn't read that date. Try <code>/panchang 2030-05-14</code>")
-        return
-    await send(update, build_panchang(dt, tz), view_keyboard("p", dt, "All"))
+async def cmd_panchang(update, ctx):
+    await show_view(update, ctx, "pan", "now")
 
 
-async def date_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tz = get_tz(context)
-    if not context.args:
-        await send(update, "📅 Send a date, e.g.\n<code>/date 2031-08-15</code>\n"
-                           "<code>/date 15/08/2031 18:30</code>\n<code>/date +90</code>",
-                   InlineKeyboardMarkup([[Btn("📅 Open Calendar", callback_data="c:now:All")]]))
-        return
-    dt = parse_when(" ".join(context.args), tz)
-    if dt is None:
-        await send(update, "⚠️ Couldn't read that date. Try <code>2031-08-15</code>, "
-                           "<code>15/08/2031 18:30</code> or <code>+90</code>")
-        return
-    await send(update, build_positions(dt, tz, "All"), view_keyboard("v", dt, "All"))
+async def cmd_ingress(update, ctx):
+    await show_view(update, ctx, "ing", "now")
 
 
-async def text_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Plain messages are tried as dates."""
-    tz = get_tz(context)
-    dt = parse_when(update.message.text, tz)
-    if dt is None:
-        await update.message.reply_text(
-            "🤔 I didn't get that. Send a date like <code>2031-08-15</code> or "
-            "<code>15 aug 2031 18:30</code>, or use the menu.",
-            parse_mode=ParseMode.HTML, reply_markup=menu_keyboard())
-        return
-    await send(update, build_positions(dt, tz, "All"), view_keyboard("v", dt, "All"))
+async def cmd_gochar(update, ctx):
+    await show_view(update, ctx, "goc", "now")
 
 
-async def transits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tz = get_tz(context)
-    dt = parse_when(" ".join(context.args), tz) if context.args else local_now(tz)
-    if dt is None:
-        await send(update, "⚠️ Couldn't read that date.")
-        return
-    await run_transits(update, dt, tz)
+async def cmd_birth(update, ctx):
+    await start_birth(update, ctx)
 
 
-async def run_transits(update, dt, tz):
-    if update.callback_query:
-        await update.callback_query.answer("Calculating…")
-    text = await asyncio.to_thread(compute_ingresses, dt, tz)
-    kb = back_keyboard([Btn("🔄 From Now", callback_data="t:now"),
-                        Btn("📅 Pick Date", callback_data=f"c:{stamp(dt)}:All")])
-    await send(update, text, kb)
-
-
-async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    a = context.args
-    usage = ("🔮 <b>Birth chart</b>\nUsage:\n<code>/chart 15-01-2000 14:30 28.61 77.20</code>\n"
-             "date · time · latitude · longitude (optional timezone at the end, e.g. <code>+5:30</code>)")
-    if len(a) < 4 or not TIME_RE.fullmatch(a[1]):
-        await send(update, usage)
-        return
-    tz = get_tz(context)
-    try:
-        lat, lon = float(a[2]), float(a[3])
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            raise ValueError
-        if len(a) > 4:
-            tz = parse_tz(a[4])
-            if tz is None:
-                raise ValueError
-        birth = parse_when(f"{a[0]} {a[1]}", tz)
-        if birth is None:
-            raise ValueError
-    except ValueError:
-        await send(update, "⚠️ Something's off with the details.\n\n" + usage)
-        return
-    try:
-        text = build_chart(birth, tz, lat, lon)
-    except Exception:
-        log.exception("chart failed")
-        await send(update, "😵 Couldn't compute that chart. Check the values and try again.")
-        return
-    await send(update, text, back_keyboard())
-
-
-async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        tz = parse_tz(context.args[0])
-        if tz is None:
-            await send(update, "⚠️ Try <code>/tz +5:30</code> or <code>/tz -8</code>")
+async def cmd_tz(update, ctx):
+    if ctx.args:
+        v = parse_tz(" ".join(ctx.args))
+        if v is None:
+            await update.message.reply_text("❌ Use e.g. /tz +5:30, /tz -8 or /tz IST")
             return
-        context.user_data["tz"] = tz
-        await send(update, f"✅ Timezone set to <b>{tz_label(tz)}</b>", back_keyboard())
+        ctx.user_data["tz"] = v
+        await update.message.reply_text(f"✅ Timezone set to <b>{tz_label(v)}</b>", parse_mode=ParseMode.HTML)
         return
-    await send(update, f"🌍 Current timezone: <b>{tz_label(get_tz(context))}</b>\nPick one or send "
-                       f"<code>/tz +5:30</code>", tz_keyboard())
+    await tz_menu(update, ctx)
 
 
-def tz_keyboard():
-    zones = [("🇮🇳 IST +5:30", 330), ("🌐 UTC", 0), ("🇺🇸 EST -5", -300), ("🇺🇸 PST -8", -480),
-             ("🇬🇧 BST +1", 60), ("🇪🇺 CET +1", 60), ("🇦🇪 GST +4", 240), ("🇵🇰 PKT +5", 300),
-             ("🇧🇩 BST +6", 360), ("🇸🇬 SGT +8", 480), ("🇯🇵 JST +9", 540), ("🇦🇺 AEST +10", 600)]
+async def tz_menu(update, ctx):
     rows = []
-    for i in range(0, len(zones), 2):
-        rows.append([Btn(l, callback_data=f"tz:{m}") for l, m in zones[i:i + 2]])
-    rows.append([Btn("🏠 Menu", callback_data="menu")])
-    return InlineKeyboardMarkup(rows)
+    for i in range(0, len(COMMON_TZ), 2):
+        rows.append([Btn(t, callback_data=f"tz:{v}") for t, v in COMMON_TZ[i:i + 2]])
+    rows.append([Btn("✏️ Custom", callback_data="tz:custom"), Btn("🏠 Menu", callback_data="menu")])
+    await deliver(update, f"🕰 <b>Timezone</b>\nCurrent: <b>{tz_label(get_tz(ctx))}</b>\nChoose one:",
+                  InlineKeyboardMarkup(rows))
 
 
-# ───────────────────────── BUTTONS ─────────────────────────
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_cancel(update, ctx):
+    ctx.user_data.pop("await", None)
+    await update.message.reply_text("Cancelled. /start for the menu.")
+
+
+# ───────────────────────── CALLBACKS ─────────────────────────
+async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    data = q.data
-    tz = get_tz(context)
-    parts = data.split(":")
-    kind = parts[0]
-
-    if kind == "t":
-        await run_transits(update, parse_stamp(parts[1], tz), tz)
-        return
     await q.answer()
+    p = q.data.split(":")
+    k = p[0]
+    tz = get_tz(ctx)
+    ud = ctx.user_data
 
-    try:
-        if kind == "noop":
+    if k == "noop":
+        return
+    if k == "close":
+        try:
+            await q.message.delete()
+        except BadRequest:
+            pass
+        return
+    if k == "menu":
+        await deliver(update, HELP, menu_kb(tz))
+        return
+    if k == "help":
+        await deliver(update, HELP, menu_kb(tz))
+        return
+
+    if k == "cal":
+        mode, y, m = p[1], int(p[2]), int(p[3])
+        y = max(1800, min(2400, y))
+        sub = "birth date" if mode == "b" else "date"
+        await deliver(update, f"{MODE_TITLE[mode]}\n📅 Pick a <b>{sub}</b> "
+                              f"(tap the month ▾ to jump to another year):", calendar_kb(mode, y, m, tz))
+        return
+    if k == "yrs":
+        mode, start = p[1], int(p[2])
+        await deliver(update, f"{MODE_TITLE[mode]}\n🗓 Pick a <b>year</b>:", year_kb(mode, start, tz))
+        return
+    if k == "ys":
+        mode, y = p[1], int(p[2])
+        await deliver(update, f"{MODE_TITLE[mode]}\n🗓 <b>{y}</b> – pick a <b>month</b>:", month_kb(mode, y))
+        return
+    if k == "day":
+        mode, ds = p[1], p[2]
+        d = datetime(int(ds[:4]), int(ds[4:6]), int(ds[6:8]))
+        await deliver(update, f"{MODE_TITLE[mode]}\n📅 <b>{fmt_date(d)}</b>\n🕒 Pick the <b>hour</b> (24h):",
+                      hour_kb(mode, ds))
+        return
+    if k == "hr":
+        mode, ds, hh = p[1], p[2], p[3]
+        d = datetime(int(ds[:4]), int(ds[4:6]), int(ds[6:8]))
+        await deliver(update, f"{MODE_TITLE[mode]}\n📅 <b>{fmt_date(d)}</b> · <b>{hh}:__</b>\n"
+                              f"⏱ Pick the <b>minute</b>:\n<i>Need an exact time? Just type it, "
+                              f"e.g. {d.day:02d}/{d.month:02d}/{d.year} {hh}:37</i>",
+                      minute_kb(mode, ds, hh))
+        return
+    if k == "tm":
+        mode, st = p[1], p[2]
+        if mode == "b":
+            dt = parse_stamp(st, tz)
+            ud["birth"] = dt
+            ud["await"] = "loc"
+            rows = []
+            if "lat" in ud:
+                rows.append([Btn("📍 Use my saved place", callback_data="ch:asc")])
+            await deliver(update, f"🎂 Birth: <b>{fmt_dt(dt)}</b> <i>({tz_label(tz)})</i>\n\n"
+                                  "Now send your <b>birth place</b>:\n"
+                                  "• attach a 📍 <b>location pin</b>, or\n"
+                                  "• type <code>latitude, longitude</code> e.g. <code>19.076, 72.877</code> "
+                                  "(use minus for S/W)\n\n"
+                                  "<i>Wrong timezone for your birth place? Use /tz first.</i>",
+                          InlineKeyboardMarkup(rows) if rows else None)
             return
-        if kind == "menu":
-            await send(update, start_text(q.from_user.first_name, tz), menu_keyboard())
-        elif kind == "help":
-            await send(update, HELP, back_keyboard())
-        elif kind == "tzmenu":
-            await send(update, f"🌍 Current timezone: <b>{tz_label(tz)}</b>\nPick one or send "
-                               f"<code>/tz +5:30</code>", tz_keyboard())
-        elif kind == "tz":
-            context.user_data["tz"] = int(parts[1])
-            await send(update, f"✅ Timezone set to <b>{tz_label(int(parts[1]))}</b>", menu_keyboard())
-        elif kind == "v":
-            dt = parse_stamp(parts[1], tz)
-            planet = parts[2] or "All"
-            await send(update, build_positions(dt, tz, planet, live=parts[1] == "now"),
-                       view_keyboard("v", dt, planet))
-        elif kind == "p":
-            dt = parse_stamp(parts[1], tz)
-            await send(update, build_panchang(dt, tz), view_keyboard("p", dt, "All"))
-        elif kind == "c":
-            dt = parse_stamp(parts[1], tz)
-            planet = parts[2] or "All"
-            await send(update, "📅 <b>Pick a date</b>\n<i>Use ‹ › for months and « » for years. "
-                               "Tap a day to see the sky.</i>", calendar_keyboard(dt, planet))
-    except (ValueError, OverflowError):
-        await send(update, "⚠️ That date is out of range.", back_keyboard())
+        kind = {"p": "pos", "n": "pan", "i": "ing", "g": "goc"}[mode]
+        await show_view(update, ctx, kind, st, ("All", "d") if kind == "pos" else ())
+        return
+
+    if k in ("pos", "pan", "ing", "goc"):
+        await show_view(update, ctx, k, p[1], p[2:])
+        return
+
+    if k == "rs":
+        what, st = p[1], p[2]
+        if what == "menu":
+            text, kb = rashi_picker(ud, st)
+            await deliver(update, text, kb)
+            return
+        if what == "b":
+            try:
+                pos = await run_calc(lambda: calc_positions(to_jd(ud["birth"], tz)))
+                ud["rashi"] = int(pos["Moon"][0] // 30)
+            except Exception:
+                await deliver(update, "⚠️ Create your birth chart first (/birth).", None)
+                return
+        else:
+            ud["rashi"] = int(what)
+        await show_view(update, ctx, "goc", st)
+        return
+
+    if k == "ch":
+        await show_chart(update, ctx, p[1])
+        return
+
+    if k == "tz":
+        if p[1] == "menu":
+            await tz_menu(update, ctx)
+        elif p[1] == "custom":
+            ud["await"] = "tz"
+            await deliver(update, "✏️ Type your offset, e.g. <code>+5:30</code>, <code>-8</code>, <code>IST</code>", None)
+        else:
+            ud["tz"] = int(p[1])
+            await deliver(update, f"✅ Timezone set to <b>{tz_label(ud['tz'])}</b>", menu_kb(ud["tz"]))
+        return
 
 
-async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Update caused error", exc_info=context.error)
+# ───────────────────────── MESSAGES ─────────────────────────
+async def on_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ud = ctx.user_data
+    if ud.get("await") != "loc" or "birth" not in ud:
+        await update.message.reply_text("Use /birth first, then send your birth place.")
+        return
+    loc = update.message.location
+    ud["lat"], ud["lon"] = loc.latitude, loc.longitude
+    ud.pop("await", None)
+    await show_chart(update, ctx, "asc")
 
 
-# ───────────────────────── MAIN ─────────────────────────
-if __name__ == "__main__":
-    print("🚀 Bot is spinning up... Press CTRL+C to stop.")
-    keep_alive()  # 24/7 keep-alive web server
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ud = ctx.user_data
+    txt = update.message.text.strip()
+    tz = get_tz(ctx)
+    aw = ud.get("await")
 
-    app = Application.builder().token(TOKEN).build()
+    if aw == "loc" and "birth" in ud:
+        ll = parse_latlon(txt)
+        if not ll:
+            await update.message.reply_text("❌ Send as <code>lat, lon</code> e.g. <code>28.61, 77.21</code> "
+                                            "or share a 📍 pin. /cancel to stop.", parse_mode=ParseMode.HTML)
+            return
+        ud["lat"], ud["lon"] = ll
+        ud.pop("await", None)
+        await show_chart(update, ctx, "asc")
+        return
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("planets", planets_menu))
-    app.add_handler(CommandHandler("panchang", panchang_cmd))
-    app.add_handler(CommandHandler("date", date_cmd))
-    app.add_handler(CommandHandler("transits", transits_cmd))
-    app.add_handler(CommandHandler("chart", chart_cmd))
-    app.add_handler(CommandHandler("tz", tz_cmd))
-    app.add_handler(CallbackQueryHandler(button_click))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_date))
-    app.add_error_handler(on_error)
+    if aw == "tz":
+        v = parse_tz(txt)
+        if v is None:
+            await update.message.reply_text("❌ Try <code>+5:30</code>, <code>-8</code> or <code>IST</code>",
+                                            parse_mode=ParseMode.HTML)
+            return
+        ud["tz"] = v
+        ud.pop("await", None)
+        await update.message.reply_text(f"✅ Timezone set to <b>{tz_label(v)}</b>", parse_mode=ParseMode.HTML)
+        return
 
+    dt = parse_when(txt, tz)
+    if dt is None:
+        await update.message.reply_text("🤔 Didn't get that. Try /date for the calendar, or type a date like "
+                                        "<code>14 may 2030</code>.", parse_mode=ParseMode.HTML)
+        return
+    await show_view(update, ctx, "pos", stamp(dt), ("All", "d"))
+
+
+async def post_init(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Menu"), BotCommand("now", "Live planetary degrees"),
+        BotCommand("date", "Pick a date from calendar"), BotCommand("panchang", "Panchang"),
+        BotCommand("ingress", "Upcoming sign changes"), BotCommand("gochar", "Transits from Moon sign"),
+        BotCommand("birth", "Birth chart & dasha"), BotCommand("tz", "Set timezone"),
+        BotCommand("cancel", "Cancel current input"),
+    ])
+
+
+def main():
+    if not TOKEN or TOKEN == "8792120272:AAHvhMHbQNqg5lwAnwPXtPuf3R1mTVTHQUc":
+        raise SystemExit("❌ Bot token missing! Set the TELEGRAM_TOKEN environment variable "
+                         "(or edit the TOKEN line near the top of this file).")
+    keep_alive()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    for name, fn in [("start", cmd_start), ("help", cmd_start), ("now", cmd_now), ("date", cmd_date),
+                     ("panchang", cmd_panchang), ("ingress", cmd_ingress), ("gochar", cmd_gochar),
+                     ("birth", cmd_birth), ("chart", cmd_birth), ("tz", cmd_tz), ("cancel", cmd_cancel)]:
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(MessageHandler(filters.LOCATION, on_location))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    log.info("Vedic astro bot running…")
     app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
